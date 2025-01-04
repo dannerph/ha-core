@@ -1,12 +1,9 @@
 {
   "services": {
-    "request_data": {
-      "service": "mdi:database-arrow-down"
-    },
-    "authorize": {
+    "start": {
       "service": "mdi:lock"
     },
-    "deauthorize": {
+    "stop": {
       "service": "mdi:lock-open"
     },
     "set_energy": {
@@ -15,11 +12,17 @@
     "set_current": {
       "service": "mdi:flash"
     },
-    "enable": {
+    "set_charging_power": {
       "service": "mdi:flash"
     },
-    "disable": {
-      "service": "mdi:fash-off"
+    "set_output": {
+      "service": "mdi:export:"
+    },
+    "x2src": {
+      "service": "mdi:export"
+    },
+    "x2": {
+      "service": "mdi:export"
     },
     "set_failsafe": {
       "service": "mdi:message-alert"

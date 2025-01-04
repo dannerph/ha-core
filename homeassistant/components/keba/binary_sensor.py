@@ -1,123 +1,126 @@
 """Support for KEBA charging station binary sensors."""
 
-from __future__ import annotations
-
+from collections.abc import Mapping
 from typing import Any
+
+from keba_kecontact.charging_station import ChargingStation
+from keba_kecontact.connection import KebaKeContact
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
+    BinarySensorEntityDescription,
 )
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_HOST, EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from . import DOMAIN, KebaHandler
+from .const import DOMAIN, KEBA_CONNECTION
+from .entity import KebaBaseEntity
+
+SENSOR_TYPES = [
+    # default
+    BinarySensorEntityDescription(
+        key="Plug_EV",
+        name="Plugged on EV",
+        device_class=BinarySensorDeviceClass.PLUG,
+    ),
+    BinarySensorEntityDescription(
+        key="FS_on",
+        name="Failsafe mode",
+        device_class=BinarySensorDeviceClass.SAFETY,
+    ),
+    BinarySensorEntityDescription(
+        key="State_on",
+        name="Charging",
+        device_class=BinarySensorDeviceClass.POWER,
+    ),
+    BinarySensorEntityDescription(
+        key="Enable user",
+        name="Enable user",
+        device_class=BinarySensorDeviceClass.POWER,
+    ),
+    # optional
+    BinarySensorEntityDescription(
+        key="Plug_charging_station",
+        name="Cable plugged on charging station",
+        device_class=BinarySensorDeviceClass.PLUG,
+        entity_registry_enabled_default=False,
+    ),
+    BinarySensorEntityDescription(
+        key="Plug_locked",
+        name="Cable locked",
+        device_class=BinarySensorDeviceClass.PLUG,
+        entity_registry_enabled_default=False,
+    ),
+    BinarySensorEntityDescription(
+        key="Authreq",
+        name="Authreq",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    BinarySensorEntityDescription(
+        key="AuthON",
+        name="AuthON",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    BinarySensorEntityDescription(
+        key="X2 phaseSwitch",
+        name="X2 Phase Switch",
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+]
 
 
-async def async_setup_platform(
+async def async_setup_entry(
     hass: HomeAssistant,
-    config: ConfigType,
+    config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up the KEBA charging station platform."""
-    if discovery_info is None:
-        return
+    """Set up the keba charging station binary sensors from config entry."""
+    keba: KebaKeContact = hass.data[DOMAIN][KEBA_CONNECTION]
+    entities: list[KebaBinarySensor] = []
 
-    keba: KebaHandler = hass.data[DOMAIN]
-
-    sensors = [
-        KebaBinarySensor(
-            keba,
-            "Online",
-            "Status",
-            "device_state",
-            BinarySensorDeviceClass.CONNECTIVITY,
-        ),
-        KebaBinarySensor(
-            keba,
-            "Plug",
-            "Plug",
-            "plug_state",
-            BinarySensorDeviceClass.PLUG,
-        ),
-        KebaBinarySensor(
-            keba,
-            "State",
-            "Charging State",
-            "charging_state",
-            BinarySensorDeviceClass.POWER,
-        ),
-        KebaBinarySensor(
-            keba,
-            "Tmo FS",
-            "Failsafe Mode",
-            "failsafe_mode_state",
-            BinarySensorDeviceClass.SAFETY,
-        ),
-    ]
-    async_add_entities(sensors)
+    charging_station = keba.get_charging_station(config_entry.data[CONF_HOST])
+    entities.extend(
+        [
+            KebaBinarySensor(charging_station, description)
+            for description in SENSOR_TYPES
+        ]
+    )
+    async_add_entities(entities, True)
 
 
-class KebaBinarySensor(BinarySensorEntity):
-    """Representation of a binary sensor of a KEBA charging station."""
-
-    _attr_should_poll = False
+class KebaBinarySensor(KebaBaseEntity, BinarySensorEntity):
+    """The entity class for KEBA charging stations sensors."""
 
     def __init__(
         self,
-        keba: KebaHandler,
-        key: str,
-        name: str,
-        entity_type: str,
-        device_class: BinarySensorDeviceClass,
+        charging_station: ChargingStation,
+        description: BinarySensorEntityDescription,
     ) -> None:
         """Initialize the KEBA Sensor."""
-        self._key = key
-        self._keba = keba
-        self._attributes: dict[str, Any] = {}
-
-        self._attr_device_class = device_class
-        self._attr_name = f"{keba.device_name} {name}"
-        self._attr_unique_id = f"{keba.device_id}_{entity_type}"
+        super().__init__(charging_station, description)
+        self._attributes: dict[str, str] = {}
 
     @property
-    def extra_state_attributes(self) -> dict[str, Any]:
+    def extra_state_attributes(self) -> Mapping[str, Any] | None:
         """Return the state attributes of the binary sensor."""
         return self._attributes
 
     async def async_update(self) -> None:
         """Get latest cached states from the device."""
-        if self._key == "Online":
-            self._attr_is_on = self._keba.get_value(self._key)
+        key = self.entity_description.key
+        self._attr_is_on = self._charging_station.get_value(key)
 
-        elif self._key == "Plug":
-            self._attr_is_on = self._keba.get_value("Plug_plugged")
-            self._attributes["plugged_on_wallbox"] = self._keba.get_value(
-                "Plug_wallbox"
+        if key == "FS_on":
+            self._attr_is_on = not self._attr_is_on
+            self._attributes["failsafe_timeout"] = str(
+                self._charging_station.get_value("Tmo FS")
             )
-            self._attributes["plug_locked"] = self._keba.get_value("Plug_locked")
-            self._attributes["plugged_on_EV"] = self._keba.get_value("Plug_EV")
-
-        elif self._key == "State":
-            self._attr_is_on = self._keba.get_value("State_on")
-            self._attributes["status"] = self._keba.get_value("State_details")
-            self._attributes["max_charging_rate"] = str(
-                self._keba.get_value("Max curr")
+            self._attributes["fallback_current"] = str(
+                self._charging_station.get_value("Curr FS")
             )
-
-        elif self._key == "Tmo FS":
-            self._attr_is_on = not self._keba.get_value("FS_on")
-            self._attributes["failsafe_timeout"] = str(self._keba.get_value("Tmo FS"))
-            self._attributes["fallback_current"] = str(self._keba.get_value("Curr FS"))
-        elif self._key == "Authreq":
-            self._attr_is_on = self._keba.get_value(self._key) == 0
-
-    def update_callback(self) -> None:
-        """Schedule a state update."""
-        self.async_schedule_update_ha_state(True)
-
-    async def async_added_to_hass(self) -> None:
-        """Add update callback after being added to hass."""
-        self._keba.add_update_listener(self.update_callback)

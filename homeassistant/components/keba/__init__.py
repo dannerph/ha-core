@@ -1,244 +1,199 @@
 """Support for KEBA charging stations."""
 
-import asyncio
 import logging
 
-from keba_kecontact.connection import KebaKeContact
+from keba_kecontact import create_keba_connection
+from keba_kecontact.charging_station import ChargingStation, KebaService
+from keba_kecontact.connection import KebaKeContact, SetupError
 import voluptuous as vol
 
-from homeassistant.const import CONF_HOST, Platform
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
+from homeassistant.const import CONF_DEVICE_ID, CONF_HOST, Platform
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers import discovery
+from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
+from homeassistant.helpers import device_registry as dr
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
 from homeassistant.helpers.typing import ConfigType
+
+from .const import (
+    CHARGING_STATIONS,
+    CONF_RFID,
+    CONF_RFID_CLASS,
+    DATA_HASS_CONFIG,
+    DOMAIN,
+    KEBA_CONNECTION,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "keba"
-PLATFORMS = (Platform.BINARY_SENSOR, Platform.SENSOR, Platform.LOCK, Platform.NOTIFY)
-
-CONF_RFID = "rfid"
-CONF_FS = "failsafe"
-CONF_FS_TIMEOUT = "failsafe_timeout"
-CONF_FS_FALLBACK = "failsafe_fallback"
-CONF_FS_PERSIST = "failsafe_persist"
-CONF_FS_INTERVAL = "refresh_interval"
-
-MAX_POLLING_INTERVAL = 5  # in seconds
-MAX_FAST_POLLING_COUNT = 4
-
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.LOCK,
+    Platform.NOTIFY,
+    Platform.NUMBER,
+    Platform.SENSOR,
+]
 CONFIG_SCHEMA = vol.Schema(
     {
         DOMAIN: vol.Schema(
             {
                 vol.Required(CONF_HOST): cv.string,
                 vol.Optional(CONF_RFID, default="00845500"): cv.string,
-                vol.Optional(CONF_FS, default=False): cv.boolean,
-                vol.Optional(CONF_FS_TIMEOUT, default=30): cv.positive_int,
-                vol.Optional(CONF_FS_FALLBACK, default=6): cv.positive_int,
-                vol.Optional(CONF_FS_PERSIST, default=0): cv.positive_int,
-                vol.Optional(CONF_FS_INTERVAL, default=5): cv.positive_int,
             }
         )
     },
     extra=vol.ALLOW_EXTRA,
 )
 
-_SERVICE_MAP = {
-    "request_data": "async_request_data",
-    "set_energy": "async_set_energy",
-    "set_current": "async_set_current",
-    "authorize": "async_start",
-    "deauthorize": "async_stop",
-    "enable": "async_enable_ev",
-    "disable": "async_disable_ev",
-    "set_failsafe": "async_set_failsafe",
-}
-
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Check connectivity and version of KEBA charging station."""
-    host = config[DOMAIN][CONF_HOST]
-    rfid = config[DOMAIN][CONF_RFID]
-    refresh_interval = config[DOMAIN][CONF_FS_INTERVAL]
-    keba = KebaHandler(hass, host, rfid, refresh_interval)
-    hass.data[DOMAIN] = keba
+    """Set up the KEBA charging station component from configuration.yaml."""
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][DATA_HASS_CONFIG] = config
 
-    # Wait for KebaHandler setup complete (initial values loaded)
-    if not await keba.setup():
-        _LOGGER.error("Could not find a charging station at %s", host)
-        return False
+    if DOMAIN in config:
+        async_create_issue(
+            hass,
+            DOMAIN,
+            "deprecated_yaml",
+            is_fixable=False,
+            severity=IssueSeverity.WARNING,
+            translation_key="deprecated_yaml",
+        )
+        hass.async_create_task(
+            hass.config_entries.flow.async_init(
+                DOMAIN, context={"source": SOURCE_IMPORT}, data=config[DOMAIN]
+            )
+        )
+    return True
 
-    # Set failsafe mode at start up of Home Assistant
-    failsafe = config[DOMAIN][CONF_FS]
-    timeout = config[DOMAIN][CONF_FS_TIMEOUT] if failsafe else 0
-    fallback = config[DOMAIN][CONF_FS_FALLBACK] if failsafe else 0
-    persist = config[DOMAIN][CONF_FS_PERSIST] if failsafe else 0
+
+def _get_charging_station(
+    hass: HomeAssistant, device_id: str
+) -> ChargingStation | None:
+    # Get and check home assistant device linked to device_id
+    device = dr.async_get(hass).async_get(device_id)
+    if not device:
+        _LOGGER.error("Could not find a device for id: %s", device_id)
+        return None
+
+    # Get and check config_entry of given home assistant device
+    config_entry = hass.config_entries.async_get_entry(
+        next(iter(device.config_entries))
+    )
+    if config_entry is None:
+        _LOGGER.fatal("Config entry for device %s not valid", str(device))
+        return None
+
+    # Get and check keba charging station from host in config_entry
+    keba = hass.data[DOMAIN][KEBA_CONNECTION]
+    host = config_entry.data[CONF_HOST]
+    charging_station = keba.get_charging_station(host)
+    if charging_station is None:
+        _LOGGER.error("Could not find a charging station with host %s", host)
+        return None
+
+    return charging_station
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up KEBA charging station from a config entry."""
+    keba = await get_keba_connection(hass)
     try:
-        hass.loop.create_task(keba.set_failsafe(timeout, fallback, persist))
-    except ValueError as ex:
-        _LOGGER.warning("Could not set failsafe mode %s", ex)
+        charging_station = await keba.setup_charging_station(entry.data[CONF_HOST])
+    except SetupError as exc:
+        raise ConfigEntryNotReady(f"{entry.data[CONF_HOST]} not reachable") from exc
+
+    hass.data[DOMAIN][CHARGING_STATIONS][entry.entry_id] = charging_station
+
+    # Add update listener for config entry changes (options)
+    entry.async_on_unload(entry.add_update_listener(update_listener))
 
     # Register services to hass
     async def execute_service(call: ServiceCall) -> None:
-        """Execute a service to KEBA charging station.
-
-        This must be a member function as we need access to the keba
-        object here.
-        """
-        function_name = _SERVICE_MAP[call.service]
-        function_call = getattr(keba, function_name)
-        await function_call(call.data)
-
-    for service in _SERVICE_MAP:
-        hass.services.async_register(DOMAIN, service, execute_service)
-
-    # Load components
-    for platform in PLATFORMS:
-        hass.async_create_task(
-            discovery.async_load_platform(hass, platform, DOMAIN, {}, config)
+        """Execute a service for a charging station."""
+        device_id: str = str(call.data.get(CONF_DEVICE_ID))
+        charging_station: ChargingStation | None = _get_charging_station(
+            hass, device_id
         )
+        if charging_station is None:
+            return
 
-    # Start periodic polling of charging station data
-    keba.start_periodic_request()
+        function_call = getattr(charging_station, call.service)
+
+        additional_args = {}
+        if call.service in ["start", "stop"]:
+            if (
+                CONF_RFID not in call.data
+                and CONF_RFID in entry.options
+                and entry.options[CONF_RFID] != ""
+            ):
+                additional_args[CONF_RFID] = entry.options[CONF_RFID]
+            if (
+                CONF_RFID_CLASS not in call.data
+                and CONF_RFID_CLASS in entry.options
+                and entry.options[CONF_RFID_CLASS] != ""
+            ):
+                additional_args[CONF_RFID_CLASS] = entry.options[CONF_RFID_CLASS]
+        parameters = call.data.copy()
+        parameters.pop(CONF_DEVICE_ID)
+        try:
+            await function_call(**parameters, **additional_args)
+        except NotImplementedError as ex:
+            raise ServiceValidationError(
+                "Service is not available on this charging station"
+            ) from ex
+
+    for service in charging_station.device_info.available_services():
+        if service != KebaService.DISPLAY:
+            hass.services.async_register(DOMAIN, service.value, execute_service)
+
+    # Set up all platforms
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-class KebaHandler(KebaKeContact):
-    """Representation of a KEBA charging station connection."""
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    keba = hass.data[DOMAIN][KEBA_CONNECTION]
 
-    def __init__(self, hass, host, rfid, refresh_interval):
-        """Initialize charging station connection."""
-        super().__init__(host, self.hass_callback)
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-        self._update_listeners = []
-        self._hass = hass
-        self.rfid = rfid
-        self.device_name = "keba"  # correct device name will be set in setup()
-        self.device_id = "keba_wallbox_"  # correct device id will be set in setup()
+    # Remove notify
+    charging_station = keba.get_charging_station(entry.data[CONF_HOST])
+    # if KebaService.DISPLAY in charging_station.device_info.available_services():
+    #     hass.services.async_remove(
+    #         Platform.NOTIFY, f"{DOMAIN}_{slugify(charging_station.device_info.model)}"
+    #     )
 
-        # Ensure at least MAX_POLLING_INTERVAL seconds delay
-        self._refresh_interval = max(MAX_POLLING_INTERVAL, refresh_interval)
-        self._fast_polling_count = MAX_FAST_POLLING_COUNT
-        self._polling_task = None
+    # Only remove services if it is the last charging station
+    if len(hass.data[DOMAIN][CHARGING_STATIONS]) == 1:
+        _LOGGER.debug("Removing last charging station, cleanup services")
 
-    def start_periodic_request(self):
-        """Start periodic data polling."""
-        self._polling_task = self._hass.loop.create_task(self._periodic_request())
+        for service in charging_station.device_info.available_services():
+            hass.services.async_remove(DOMAIN, service.value)
 
-    async def _periodic_request(self):
-        """Send  periodic update requests."""
-        await self.request_data()
+    if unload_ok:
+        keba.remove_charging_station(entry.data[CONF_HOST])
+        hass.data[DOMAIN][CHARGING_STATIONS].pop(entry.entry_id)
 
-        if self._fast_polling_count < MAX_FAST_POLLING_COUNT:
-            self._fast_polling_count += 1
-            _LOGGER.debug("Periodic data request executed, now wait for 2 seconds")
-            await asyncio.sleep(2)
-        else:
-            _LOGGER.debug(
-                "Periodic data request executed, now wait for %s seconds",
-                self._refresh_interval,
-            )
-            await asyncio.sleep(self._refresh_interval)
+    return unload_ok
 
-        _LOGGER.debug("Periodic data request rescheduled")
-        self._polling_task = self._hass.loop.create_task(self._periodic_request())
 
-    async def setup(self, loop=None):
-        """Initialize KebaHandler object."""
-        await super().setup(loop)
+async def update_listener(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
+    """Handle options update."""
+    await hass.config_entries.async_reload(config_entry.entry_id)
 
-        # Request initial values and extract serial number
-        await self.request_data()
-        if (
-            self.get_value("Serial") is not None
-            and self.get_value("Product") is not None
-        ):
-            self.device_id = f"keba_wallbox_{self.get_value('Serial')}"
-            self.device_name = self.get_value("Product")
-            return True
 
-        return False
+async def get_keba_connection(hass: HomeAssistant) -> KebaKeContact:
+    """Set up internal keba connection (ensure same keba connection instance)."""
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN].setdefault(CHARGING_STATIONS, {})
 
-    def hass_callback(self, data):
-        """Handle component notification via callback."""
+    if KEBA_CONNECTION not in hass.data[DOMAIN]:
+        hass.data[DOMAIN][KEBA_CONNECTION] = await create_keba_connection(hass.loop)
 
-        # Inform entities about updated values
-        for listener in self._update_listeners:
-            listener()
-
-        _LOGGER.debug("Notifying %d listeners", len(self._update_listeners))
-
-    def _set_fast_polling(self):
-        _LOGGER.debug("Fast polling enabled")
-        self._fast_polling_count = 0
-        self._polling_task.cancel()
-        self._polling_task = self._hass.loop.create_task(self._periodic_request())
-
-    def add_update_listener(self, listener):
-        """Add a listener for update notifications."""
-        self._update_listeners.append(listener)
-
-        # initial data is already loaded, thus update the component
-        listener()
-
-    async def async_request_data(self, param):
-        """Request new data in async way."""
-        await self.request_data()
-        _LOGGER.debug("New data from KEBA wallbox requested")
-
-    async def async_set_energy(self, param):
-        """Set energy target in async way."""
-        try:
-            energy = param["energy"]
-            await self.set_energy(float(energy))
-            self._set_fast_polling()
-        except (KeyError, ValueError) as ex:
-            _LOGGER.warning("Energy value is not correct. %s", ex)
-
-    async def async_set_current(self, param):
-        """Set current maximum in async way."""
-        try:
-            current = param["current"]
-            await self.set_current(float(current))
-            # No fast polling as this function might be called regularly
-        except (KeyError, ValueError) as ex:
-            _LOGGER.warning("Current value is not correct. %s", ex)
-
-    async def async_start(self, param=None):
-        """Authorize EV in async way."""
-        await self.start(self.rfid)
-        self._set_fast_polling()
-
-    async def async_stop(self, param=None):
-        """De-authorize EV in async way."""
-        await self.stop(self.rfid)
-        self._set_fast_polling()
-
-    async def async_enable_ev(self, param=None):
-        """Enable EV in async way."""
-        await self.enable(True)
-        self._set_fast_polling()
-
-    async def async_disable_ev(self, param=None):
-        """Disable EV in async way."""
-        await self.enable(False)
-        self._set_fast_polling()
-
-    async def async_set_failsafe(self, param=None):
-        """Set failsafe mode in async way."""
-        try:
-            timeout = param[CONF_FS_TIMEOUT]
-            fallback = param[CONF_FS_FALLBACK]
-            persist = param[CONF_FS_PERSIST]
-            await self.set_failsafe(int(timeout), float(fallback), bool(persist))
-            self._set_fast_polling()
-        except (KeyError, ValueError) as ex:
-            _LOGGER.warning(
-                (
-                    "Values are not correct for: failsafe_timeout, failsafe_fallback"
-                    " and/or failsafe_persist: %s"
-                ),
-                ex,
-            )
+    return hass.data[DOMAIN][KEBA_CONNECTION]
